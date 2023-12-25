@@ -33,7 +33,7 @@ class TSDFVolume:
     # Define voxel volume parameters
     self._vol_bnds = vol_bnds
     self._voxel_size = float(voxel_size)
-    self._trunc_margin = 5 * self._voxel_size  # truncation on SDF
+    self._trunc_margin = 5 * self._voxel_size  # truncation on SDF，截断距离为5个体素距离
     self._color_const = 256 * 256
 
     # Adjust volume bounds and ensure C-order contiguous
@@ -47,14 +47,20 @@ class TSDFVolume:
     )
 
     # Initialize pointers to voxel volume in CPU memory
+    # 包括三维坐标、权重、颜色
+
+    # 初始化网格所有的值为1
     self._tsdf_vol_cpu = np.ones(self._vol_dim).astype(np.float32)
     # for computing the cumulative moving average of observations per voxel
+    # 权重初始化为0
     self._weight_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
+    # 颜色初始化为0
     self._color_vol_cpu = np.zeros(self._vol_dim).astype(np.float32)
 
     self.gpu_mode = use_gpu and FUSION_GPU_MODE
 
     # Copy voxel volumes to GPU
+    # 把TSDF存储到GPU中
     if self.gpu_mode:
       self._tsdf_vol_gpu = cuda.mem_alloc(self._tsdf_vol_cpu.nbytes)
       cuda.memcpy_htod(self._tsdf_vol_gpu,self._tsdf_vol_cpu)
@@ -78,53 +84,55 @@ class TSDFVolume:
           // Get voxel index
           int gpu_loop_idx = (int) other_params[0];
           int max_threads_per_block = blockDim.x;
-          int block_idx = blockIdx.z*gridDim.y*gridDim.x+blockIdx.y*gridDim.x+blockIdx.x;
-          int voxel_idx = gpu_loop_idx*gridDim.x*gridDim.y*gridDim.z*max_threads_per_block+block_idx*max_threads_per_block+threadIdx.x;
-          int vol_dim_x = (int) vol_dim[0];
+          int block_idx = blockIdx.z*gridDim.y*gridDim.x+blockIdx.y*gridDim.x+blockIdx.x; // 获取块ID
+          int voxel_idx = gpu_loop_idx*gridDim.x*gridDim.y*gridDim.z*max_threads_per_block+block_idx*max_threads_per_block+threadIdx.x; // 对应线程即体素ID
+          int vol_dim_x = (int) vol_dim[0]; // 体素的维度
           int vol_dim_y = (int) vol_dim[1];
           int vol_dim_z = (int) vol_dim[2];
           if (voxel_idx > vol_dim_x*vol_dim_y*vol_dim_z)
               return;
-          // Get voxel grid coordinates (note: be careful when casting)
+                                        
+          // Get voxel grid coordinates (note: be careful when casting)，得到体素网格的序号
           float voxel_x = floorf(((float)voxel_idx)/((float)(vol_dim_y*vol_dim_z)));
           float voxel_y = floorf(((float)(voxel_idx-((int)voxel_x)*vol_dim_y*vol_dim_z))/((float)vol_dim_z));
           float voxel_z = (float)(voxel_idx-((int)voxel_x)*vol_dim_y*vol_dim_z-((int)voxel_y)*vol_dim_z);
-          // Voxel grid coordinates to world coordinates
+          // Voxel grid coordinates to world coordinates，从体素网格转到世界坐标
           float voxel_size = other_params[1];
           float pt_x = vol_origin[0]+voxel_x*voxel_size;
           float pt_y = vol_origin[1]+voxel_y*voxel_size;
           float pt_z = vol_origin[2]+voxel_z*voxel_size;
-          // World coordinates to camera coordinates
-          float tmp_pt_x = pt_x-cam_pose[0*4+3];
+          // World coordinates to camera coordinates，世界坐标转到相机坐标
+          float tmp_pt_x = pt_x-cam_pose[0*4+3]; // 平移
           float tmp_pt_y = pt_y-cam_pose[1*4+3];
           float tmp_pt_z = pt_z-cam_pose[2*4+3];
-          float cam_pt_x = cam_pose[0*4+0]*tmp_pt_x+cam_pose[1*4+0]*tmp_pt_y+cam_pose[2*4+0]*tmp_pt_z;
+          float cam_pt_x = cam_pose[0*4+0]*tmp_pt_x+cam_pose[1*4+0]*tmp_pt_y+cam_pose[2*4+0]*tmp_pt_z; // 旋转
           float cam_pt_y = cam_pose[0*4+1]*tmp_pt_x+cam_pose[1*4+1]*tmp_pt_y+cam_pose[2*4+1]*tmp_pt_z;
           float cam_pt_z = cam_pose[0*4+2]*tmp_pt_x+cam_pose[1*4+2]*tmp_pt_y+cam_pose[2*4+2]*tmp_pt_z;
-          // Camera coordinates to image pixels
+          // Camera coordinates to image pixels，相机坐标系投影到像素坐标系
           int pixel_x = (int) roundf(cam_intr[0*3+0]*(cam_pt_x/cam_pt_z)+cam_intr[0*3+2]);
           int pixel_y = (int) roundf(cam_intr[1*3+1]*(cam_pt_y/cam_pt_z)+cam_intr[1*3+2]);
-          // Skip if outside view frustum
+          // Skip if outside view frustum，跳过越界
           int im_h = (int) other_params[2];
           int im_w = (int) other_params[3];
           if (pixel_x < 0 || pixel_x >= im_w || pixel_y < 0 || pixel_y >= im_h || cam_pt_z<0)
               return;
-          // Skip invalid depth
+          // Skip invalid depth，跳过深度图中深度为0的值
           float depth_value = depth_im[pixel_y*im_w+pixel_x];
           if (depth_value == 0)
               return;
-          // Integrate TSDF
+          // Integrate TSDF，计算TSDF
           float trunc_margin = other_params[4];
-          float depth_diff = depth_value-cam_pt_z;
-          if (depth_diff < -trunc_margin)
+          float depth_diff = depth_value-cam_pt_z; // 深度图中的值 - 体素的投影到相机坐标系的Z
+          if (depth_diff < -trunc_margin) // 当深度图的值比体素中的值近 5个体素距离时不计算。计算 tsdf(x) = max[-1, min(1,sdf(x)/t)]，此处为公式中的min
               return;
-          float dist = fmin(1.0f,depth_diff/trunc_margin);
-          float w_old = weight_vol[voxel_idx];
-          float obs_weight = other_params[5];
-          float w_new = w_old + obs_weight;
-          weight_vol[voxel_idx] = w_new;
-          tsdf_vol[voxel_idx] = (tsdf_vol[voxel_idx]*w_old+obs_weight*dist)/w_new;
-          // Integrate color
+          float dist = fmin(1.0f,depth_diff/trunc_margin); // 计算 tsdf(x) = max[-1, min(1,sdf(x)/t)]，此处为公式中的min，小于这个截断距离的全都赋值为1
+          // 体素融合
+          float w_old = weight_vol[voxel_idx]; // 老权重
+          float obs_weight = other_params[5];  // 这一帧的权重，默认设置为1
+          float w_new = w_old + obs_weight;    // 权重相加
+          weight_vol[voxel_idx] = w_new;       // 设置新权重为权重相加
+          tsdf_vol[voxel_idx] = (tsdf_vol[voxel_idx]*w_old+obs_weight*dist)/w_new;  // 权重融合
+          // Integrate color，颜色融合，同样使用权重
           float old_color = color_vol[voxel_idx];
           float old_b = floorf(old_color/(256*256));
           float old_g = floorf((old_color-old_b*256*256)/256);
@@ -141,14 +149,15 @@ class TSDFVolume:
 
       self._cuda_integrate = self._cuda_src_mod.get_function("integrate")
 
-      # Determine block/grid size on GPU
+      # Determine block/grid size on GPU，线程网格调度线程块，线程块则控制线程
       gpu_dev = cuda.Device(0)
-      self._max_gpu_threads_per_block = gpu_dev.MAX_THREADS_PER_BLOCK
-      n_blocks = int(np.ceil(float(np.prod(self._vol_dim))/float(self._max_gpu_threads_per_block)))
-      grid_dim_x = min(gpu_dev.MAX_GRID_DIM_X,int(np.floor(np.cbrt(n_blocks))))
+      self._max_gpu_threads_per_block = gpu_dev.MAX_THREADS_PER_BLOCK # 获取gpu每个block的最大线程数量
+      n_blocks = int(np.ceil(float(np.prod(self._vol_dim))/float(self._max_gpu_threads_per_block))) # 计算需要的block数量，体素数量/每个block的最大线程数
+      grid_dim_x = min(gpu_dev.MAX_GRID_DIM_X,int(np.floor(np.cbrt(n_blocks)))) # 网格维度
       grid_dim_y = min(gpu_dev.MAX_GRID_DIM_Y,int(np.floor(np.sqrt(n_blocks/grid_dim_x))))
       grid_dim_z = min(gpu_dev.MAX_GRID_DIM_Z,int(np.ceil(float(n_blocks)/float(grid_dim_x*grid_dim_y))))
       self._max_gpu_grid_dim = np.array([grid_dim_x,grid_dim_y,grid_dim_z]).astype(int)
+      # GPU计算次数 = 体素数量 / (GPU线程块数量 * 每个block的最大线程)
       self._n_gpu_loops = int(np.ceil(float(np.prod(self._vol_dim))/float(np.prod(self._max_gpu_grid_dim)*self._max_gpu_threads_per_block)))
 
     else:
@@ -222,7 +231,7 @@ class TSDFVolume:
     color_im = np.floor(color_im[...,2]*self._color_const + color_im[...,1]*256 + color_im[...,0])
 
     if self.gpu_mode:  # GPU mode: integrate voxel volume (calls CUDA kernel)
-      for gpu_loop_idx in range(self._n_gpu_loops):
+      for gpu_loop_idx in range(self._n_gpu_loops): # 一般_n_gpu_loops为1
         self._cuda_integrate(self._tsdf_vol_gpu,
                             self._weight_vol_gpu,
                             self._color_vol_gpu,
@@ -236,11 +245,11 @@ class TSDFVolume:
                               im_h,
                               im_w,
                               self._trunc_margin,
-                              obs_weight
+                              obs_weight # 这一帧的权重
                             ], np.float32)),
                             cuda.InOut(color_im.reshape(-1).astype(np.float32)),
                             cuda.InOut(depth_im.reshape(-1).astype(np.float32)),
-                            block=(self._max_gpu_threads_per_block,1,1),
+                            block=(self._max_gpu_threads_per_block,1,1), # 三元组，定义了一个线程块，一次性地打开block.x*block.y*block.z个线程
                             grid=(
                               int(self._max_gpu_grid_dim[0]),
                               int(self._max_gpu_grid_dim[1]),
@@ -304,7 +313,7 @@ class TSDFVolume:
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts = measure.marching_cubes_lewiner(tsdf_vol, level=0)[0]
+    verts = measure.marching_cubes(tsdf_vol, level=0)[0]
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size + self._vol_origin
 
@@ -325,7 +334,7 @@ class TSDFVolume:
     tsdf_vol, color_vol = self.get_volume()
 
     # Marching cubes
-    verts, faces, norms, vals = measure.marching_cubes_lewiner(tsdf_vol, level=0)
+    verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, level=0)
     verts_ind = np.round(verts).astype(int)
     verts = verts*self._voxel_size+self._vol_origin  # voxel grid coordinates to world coordinates
 
